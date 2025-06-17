@@ -20,6 +20,8 @@ class CostmapCoverageExplorer:
         self.local_costmap = None
         self.merged_map = None
 
+        self.persistent_merged = None
+
         self.map_pub = rospy.Publisher("/merged_map", OccupancyGrid, queue_size=1)
         self.coverage_pub = rospy.Publisher("/coverage_marker", Marker, queue_size=10)
         self.cmd_vel_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
@@ -40,6 +42,10 @@ class CostmapCoverageExplorer:
         self.merge_thread.daemon = True
         self.merge_thread.start()
 
+        self.tracking_thread = threading.Thread(target=self.track_robot_pose_loop)
+        self.tracking_thread.daemon = True
+        self.tracking_thread.start()
+
         rospy.loginfo("Waiting for move_base server...")
         self.move_base.wait_for_server()
         rospy.loginfo("Connected to move_base")
@@ -57,7 +63,7 @@ class CostmapCoverageExplorer:
             self.local_costmap = msg
 
     def publish_merged_map_loop(self):
-        rate = rospy.Rate(15)  # Publish 5 times per second
+        rate = rospy.Rate(10)
         while not rospy.is_shutdown():
             with self.lock:
                 self.try_merge_maps()
@@ -72,16 +78,24 @@ class CostmapCoverageExplorer:
         origin = self.raw_map.info.origin.position
 
         map_np = np.array(self.raw_map.data).reshape((h, w))
-        merged = np.full_like(map_np, -1)
-
+        base_layer = np.full_like(map_np, -1)
         for y in range(h):
             for x in range(w):
                 val = map_np[y][x]
                 if val == 0:
-                    merged[y][x] = 0
-                # elif val >= 100 or val > 50:
+                    base_layer[y][x] = 0
                 elif 1 <= val <= 99 or val >= 100:
-                    merged[y][x] = 100
+                    base_layer[y][x] = 100
+
+        if self.persistent_merged is None:
+            self.persistent_merged = base_layer.copy()
+        else:
+            for y in range(h):
+                for x in range(w):
+                    if base_layer[y][x] == 0 and self.persistent_merged[y][x] != 100:
+                        self.persistent_merged[y][x] = 0
+                    elif base_layer[y][x] == -1 and self.persistent_merged[y][x] != 100:
+                        self.persistent_merged[y][x] = -1
 
         def overlay_costmap(costmap):
             cw, ch = costmap.info.width, costmap.info.height
@@ -97,19 +111,43 @@ class CostmapCoverageExplorer:
                         mx = int((wx - origin.x) / res)
                         my = int((wy - origin.y) / res)
                         if 0 <= mx < w and 0 <= my < h:
-                            merged[my][mx] = 100
+                            self.persistent_merged[my][mx] = 100
 
         overlay_costmap(self.global_costmap)
         overlay_costmap(self.local_costmap)
 
-        self.merged_map = merged
+        if self.covered_points:
+            radius_cells = int(0.6 / res)
+            for cx, cy in self.covered_points:
+                robot_map_x = int((cx - origin.x) / res)
+                robot_map_y = int((cy - origin.y) / res)
+                for dy in range(-radius_cells, radius_cells + 1):
+                    for dx in range(-radius_cells, radius_cells + 1):
+                        if math.hypot(dx, dy) > radius_cells:
+                            continue
+                        nx = robot_map_x + dx
+                        ny = robot_map_y + dy
+                        if 0 <= nx < w and 0 <= ny < h:
+                            if self.persistent_merged[ny][nx] == 0:
+                                self.persistent_merged[ny][nx] = 50  # Yellow for trail
+
+        self.merged_map = self.persistent_merged.copy()
         out = OccupancyGrid()
         out.header = self.raw_map.header
         out.info = self.raw_map.info
-        out.data = merged.flatten().tolist()
+        out.data = self.merged_map.flatten().tolist()
         self.map_pub.publish(out)
 
-    # Rest of the code (mark_coverage, rotate_in_place, get_robot_pose, etc.) remains unchanged.
+    def track_robot_pose_loop(self):
+        rate = rospy.Rate(2.0)
+        while not rospy.is_shutdown():
+            try:
+                (trans, rot) = self.listener.lookupTransform("map", "base_link", rospy.Time(0))
+                self.covered_points.append((trans[0], trans[1]))
+            except (tf.Exception, tf.LookupException, tf.ConnectivityException):
+                pass
+            rate.sleep()
+
 
     def mark_coverage(self, x, y):
         marker = Marker()
@@ -127,6 +165,28 @@ class CostmapCoverageExplorer:
         marker.pose.orientation.w = 1.0
         marker.id = len(self.covered_points)
         self.coverage_pub.publish(marker)
+
+    def mark_as_covered_in_map(self, cx, cy, radius=0.3):
+        if self.merged_map is None:
+            return
+
+        res = self.raw_map.info.resolution
+        ox, oy = self.raw_map.info.origin.position.x, self.raw_map.info.origin.position.y
+        w, h = self.raw_map.info.width, self.raw_map.info.height
+
+        mx = int((cx - ox) / res)
+        my = int((cy - oy) / res)
+        cell_radius = int(radius / res)
+
+        for dy in range(-cell_radius, cell_radius + 1):
+            for dx in range(-cell_radius, cell_radius + 1):
+                dist = math.hypot(dx, dy) * res
+                if dist <= radius:
+                    nx = mx + dx
+                    ny = my + dy
+                    if 0 <= nx < w and 0 <= ny < h:
+                        if self.merged_map[ny][nx] == 0:
+                            self.merged_map[ny][nx] = -2
 
     def rotate_in_place(self, duration=3):
         twist = Twist()
@@ -153,8 +213,8 @@ class CostmapCoverageExplorer:
     def is_far_from_obstacles(self, mx, my):
         buffer_cells = int(self.obstacle_buffer / self.raw_map.info.resolution)
         h, w = self.merged_map.shape
-        for dy in range(-buffer_cells, buffer_cells+1):
-            for dx in range(-buffer_cells, buffer_cells+1):
+        for dy in range(-buffer_cells, buffer_cells + 1):
+            for dx in range(-buffer_cells, buffer_cells + 1):
                 nx, ny = mx + dx, my + dy
                 if 0 <= nx < w and 0 <= ny < h:
                     if self.merged_map[ny][nx] == 100:
@@ -168,30 +228,66 @@ class CostmapCoverageExplorer:
         robot_map_x = int((rx - ox) / res)
         robot_map_y = int((ry - oy) / res)
 
-        candidates = []
-        for y in range(h):
-            for x in range(w):
-                if self.merged_map[y][x] != 0:
-                    continue
-                wx = ox + x * res
-                wy = oy + y * res
-                if any(math.hypot(wx - cx, wy - cy) < self.cover_radius for cx, cy in self.covered_points):
-                    continue
-                if not self.is_far_from_obstacles(x, y):
-                    continue
-                dx = x - robot_map_x
-                dy = y - robot_map_y
-                angle = math.atan2(dy, dx)
-                dist = math.hypot(dx, dy) * res
-                score = math.cos(self.angle_diff(yaw, angle))
-                candidates.append((score, dist, wx, wy))
+        max_radius = 5.0
+        step = 1.0
 
-        if not candidates:
-            return None
-        candidates.sort(key=lambda c: (-c[0], c[1]))
-        return (candidates[0][2], candidates[0][3])
+        for radius in np.arange(step, max_radius + step, step):
+            candidates = []
+            search_range = int(radius / res)
 
-    def send_goal(self, x, y):
+            for dy in range(-search_range, search_range + 1):
+                for dx in range(-search_range, search_range + 1):
+                    dist = math.hypot(dx, dy) * res
+                    if dist > radius:
+                        continue
+
+                    x = robot_map_x + dx
+                    y = robot_map_y + dy
+
+                    if not (0 <= x < w and 0 <= y < h):
+                        continue
+
+                    if self.merged_map[y][x] != 0:
+                        continue
+
+                    wx = ox + x * res
+                    wy = oy + y * res
+
+                    if any(math.hypot(wx - cx, wy - cy) < self.cover_radius for cx, cy in self.covered_points):
+                        continue
+
+                    if not self.is_far_from_obstacles(x, y):
+                        continue
+
+                    angle = math.atan2(dy, dx)
+                    front_score = math.cos(self.angle_diff(yaw, angle))
+                    candidates.append((front_score, dist, wx, wy))
+
+            if candidates:
+                candidates.sort(key=lambda c: (-c[0], c[1]))
+                return (candidates[0][2], candidates[0][3])
+
+        return None
+    
+    def send_goal(self, x, y, rx, ry):
+        angle = math.atan2(y - ry, x - rx)
+        q = tf.transformations.quaternion_from_euler(0, 0, angle)
+
+        goal = MoveBaseGoal()
+        goal.target_pose.header.frame_id = "map"
+        goal.target_pose.header.stamp = rospy.Time.now()
+        goal.target_pose.pose.position.x = x
+        goal.target_pose.pose.position.y = y
+        goal.target_pose.pose.orientation.x = q[0]
+        goal.target_pose.pose.orientation.y = q[1]
+        goal.target_pose.pose.orientation.z = q[2]
+        goal.target_pose.pose.orientation.w = q[3]
+
+        self.move_base.send_goal(goal)
+        return self.move_base.wait_for_result(rospy.Duration(30))
+
+
+    def send_goal_(self, x, y):
         goal = MoveBaseGoal()
         goal.target_pose.header.frame_id = "map"
         goal.target_pose.header.stamp = rospy.Time.now()
@@ -219,11 +315,14 @@ class CostmapCoverageExplorer:
 
             if goal:
                 rospy.loginfo("Goal: %s", goal)
-                success = self.send_goal(*goal)
+                # success = self.send_goal(*goal)
+                success = self.send_goal(goal[0], goal[1], rx, ry)
+
                 if success:
                     rospy.loginfo("Goal reached.")
                     self.covered_points.append(goal)
                     self.mark_coverage(*goal)
+                    self.mark_as_covered_in_map(*goal, radius=0.3)
                     self.rotate_in_place()
                     failures = 0
                 else:
@@ -247,4 +346,3 @@ if __name__ == '__main__':
         CostmapCoverageExplorer().run()
     except rospy.ROSInterruptException:
         pass
-
