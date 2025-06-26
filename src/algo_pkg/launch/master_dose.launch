@@ -1,0 +1,6 @@
+<launch>
+
+        <node name="virtual_dose" pkg="algo_pkg" type="dose_calculator.py" output="screen" respawn="false">
+        </node>
+
+</launch>

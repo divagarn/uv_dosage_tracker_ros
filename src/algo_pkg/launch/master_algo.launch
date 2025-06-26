@@ -1,0 +1,6 @@
+<launch>
+
+        <node name="Algo" pkg="algo_pkg" type="algo_phase_1.py" output="screen" respawn="false">
+        </node>
+
+</launch>
