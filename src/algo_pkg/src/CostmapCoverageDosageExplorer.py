@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
 
+
+"""
+CostmapCoverageDosageExplorer
+------------------------
+
+Author: Divagar N, Nishanth S, Madhavan S
+Maintainer: Divagar N (n.divagar18@gmail.com), Nishanth S (nishanths042@gmail.com), Madhavan S (madhavan2026@gmail.com)
+Date: July 2025
+
+This script implements autonomous coverage exploration for a ROS-enabled robot.
+It combines multiple occupancy maps, tracks visited areas along with dosage values 
+based on defined thresholds, and intelligently plans paths to cover the environment 
+while avoiding previously visited regions and obstacles.
+
+Key Features:
+- Merges `/map`, `/global_costmap`, and `/local_costmap` into a single unified map.
+- Tracks the robot's path and visualizes it as a green line marker in Rviz.
+- Publishes coverage markers (yellow spheres) for each visited region.
+- Prevents revisiting areas within a 0.6-meter radius.
+- Utilizes `/dose_map` to identify and navigate to cells with special dosage value representations.
+- Sends navigation goals via `move_base` with orientation-aware planning.
+- Executes a final sweep to ensure all free cells are explored and covered.
+"""
+
 import rospy
 import actionlib
 import numpy as np
@@ -15,6 +39,9 @@ from geometry_msgs.msg import Point
 
 class CostmapCoverageExplorer:
     def __init__(self):
+        """
+        Initializes all subscribers, publishers, threads, and waits for move_base server.
+        """
         rospy.init_node('turtlebot3_costmap_coverage_explorer')
 
         self.raw_map = None
@@ -63,6 +90,9 @@ class CostmapCoverageExplorer:
         self.launch_additional_file('algo_pkg', 'master_dose.launch')
 
     def launch_additional_file(self, package, launch_filename):
+        """
+        Launches an external launch file (e.g., master_dose.launch) using roslaunch.
+        """
         try:
             uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
             roslaunch.configure_logging(uuid)
@@ -80,21 +110,33 @@ class CostmapCoverageExplorer:
             rospy.logerr("Failed to launch %s from %s: %s", launch_filename, package, str(e))
 
     def map_callback(self, msg):
+        """
+        Stores the base map from /map.
+        """
         with self.lock:
             self.raw_map = msg
 
     def global_costmap_callback(self, msg):
+        """
+        Store the respective costmaps for obstacle overlay.
+        """
         with self.lock:
             self.global_costmap = msg
 
     def dose_map_callback(self, msg):
+        """
+        Receives custom occupancy grid (dose map) used for special cell navigation.
+        """
         # global dose_map_latest
         with self.dose_map_lock:
             self.dose_map_latest = msg
             print("Dose map received.")
 
 
-    def count_trail_color1_cells(self):
+    def count_dosage_colored_cells(self):
+        """
+        Counts cells in dose_map marked with dosage level -2.
+        """
         with self.dose_map_lock:
             if self.dose_map_latest is None:
                 rospy.logwarn("Dose map not received yet.")
@@ -110,6 +152,9 @@ class CostmapCoverageExplorer:
             self.local_costmap = msg
 
     def publish_merged_map_loop(self):
+        """
+        Continuously updates and publishes merged occupancy grid with coverage and obstacles.
+        """
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
             with self.lock:
@@ -117,6 +162,9 @@ class CostmapCoverageExplorer:
             rate.sleep()
 
     def try_merge_maps(self):
+        """
+        Merges raw map and overlays costmaps and visited coverage zones.
+        """
         if not self.raw_map or not self.global_costmap or not self.local_costmap:
             return
 
@@ -186,6 +234,9 @@ class CostmapCoverageExplorer:
         self.map_pub.publish(out)
 
     def track_robot_pose_loop(self):
+        """
+        Continuously logs robot pose and visualizes path in Rviz.
+        """
         rate = rospy.Rate(2.0)
         while not rospy.is_shutdown():
             try:
@@ -196,7 +247,10 @@ class CostmapCoverageExplorer:
                 pass
             rate.sleep()
 
-    def visit_trail_color_cells(self):
+    def visit_dosage_color_cells(self):
+        """
+        Clusters and navigates to cells marked with dosage value -2 in dose_map occupancy grid pixel values.
+        """
         rospy.sleep(1.0)
         with self.dose_map_lock:
             if self.dose_map_latest is None:
@@ -258,6 +312,9 @@ class CostmapCoverageExplorer:
 
 
     def publish_path_marker(self):
+        """
+        Publishes robot path as a green line in Rviz.
+        """
         marker = Marker()
         marker.header.frame_id = "map"
         marker.header.stamp = rospy.Time.now()
@@ -285,6 +342,9 @@ class CostmapCoverageExplorer:
 
 
     def mark_coverage(self, x, y):
+        """
+        Marks a visited location with a yellow sphere in Rviz.
+        """
         marker = Marker()
         marker.header.frame_id = "map"
         marker.type = Marker.SPHERE
@@ -302,6 +362,9 @@ class CostmapCoverageExplorer:
         self.coverage_pub.publish(marker)
 
     def mark_as_covered_in_map(self, cx, cy, radius=0.3):
+        """
+        Updates merged map to indicate a region has been visited.
+        """
         if self.merged_map is None:
             return
 
@@ -324,6 +387,9 @@ class CostmapCoverageExplorer:
                             self.merged_map[ny][nx] = -2
 
     def rotate_in_place(self, duration=3):
+        """
+        Rotates robot to improve local costmap data and given more uvc exposure in the area.
+        """
         twist = Twist()
         twist.angular.z = 0.5
         start = rospy.Time.now()
@@ -334,6 +400,9 @@ class CostmapCoverageExplorer:
         self.cmd_vel_pub.publish(Twist())
 
     def get_robot_pose(self):
+        """
+        Returns current robot position (x, y, yaw).
+        """
         try:
             (trans, rot) = self.listener.lookupTransform("/map", "/base_footprint", rospy.Time(0))
             x, y = trans[0], trans[1]
@@ -343,9 +412,15 @@ class CostmapCoverageExplorer:
             return None
 
     def angle_diff(self, a, b):
+        """
+        Computes shortest angular difference.
+        """
         return math.atan2(math.sin(a - b), math.cos(a - b))
     
-    def visit_all_trail_color_cells_until_done(self):
+    def visit_all_dosage_color_cells_until_done(self): 
+        """
+        Repeatedly visits dosage-colored cells until none remain means given accumulate value of log 4.
+        """
         max_retries = 10  # safety: prevent infinite loop
         retry = 0
 
@@ -416,6 +491,9 @@ class CostmapCoverageExplorer:
 
 
     def is_far_from_obstacles(self, mx, my):
+        """
+        Checks if a map cell is at a safe distance from obstacles.
+        """
         buffer_cells = int(self.obstacle_buffer / self.raw_map.info.resolution)
         h, w = self.merged_map.shape
         for dy in range(-buffer_cells, buffer_cells + 1):
@@ -427,6 +505,9 @@ class CostmapCoverageExplorer:
         return True
 
     def find_next_goal(self, rx, ry, yaw):
+        """
+        Chooses the next best goal location using distance, direction, and safety filters.
+        """
         res = self.raw_map.info.resolution
         ox, oy = self.raw_map.info.origin.position.x, self.raw_map.info.origin.position.y
         w, h = self.raw_map.info.width, self.raw_map.info.height
@@ -475,6 +556,9 @@ class CostmapCoverageExplorer:
         return None
     
     def send_goal(self, x, y, rx, ry):
+        """
+        Sends a goal to move_base with heading aligned to the goal direction.
+        """
         angle = math.atan2(y - ry, x - rx)
         q = tf.transformations.quaternion_from_euler(0, 0, angle)
 
@@ -491,19 +575,11 @@ class CostmapCoverageExplorer:
         self.move_base.send_goal(goal)
         return self.move_base.wait_for_result(rospy.Duration(30))
 
-
-    def send_goal_(self, x, y):
-        goal = MoveBaseGoal()
-        goal.target_pose.header.frame_id = "map"
-        goal.target_pose.header.stamp = rospy.Time.now()
-        goal.target_pose.pose.position.x = x
-        goal.target_pose.pose.position.y = y
-        goal.target_pose.pose.orientation.w = 1.0
-
-        self.move_base.send_goal(goal)
-        return self.move_base.wait_for_result(rospy.Duration(30))
-
     def run(self):
+        """
+        Main controller loop: coverage, final cleanup, dosage-based navigation, and shutdown.
+        """
+        
         rospy.sleep(2)
         self.rotate_in_place()
         rate = rospy.Rate(1)
@@ -548,16 +624,19 @@ class CostmapCoverageExplorer:
 
         # Delay to ensure last dose_map is received
         rospy.sleep(1.0)
-        self.count_trail_color1_cells()
+        self.count_dosage_colored_cells()
 
-        self.visit_trail_color_cells()
-        self.visit_all_trail_color_cells_until_done()
+        self.visit_dosage_color_cells()
+        self.visit_all_dosage_color_cells_until_done()
 
         rospy.loginfo("Trail region visiting complete.")
         rospy.loginfo("Stopping.")
         self.cmd_vel_pub.publish(Twist())
 
     def last_finder(self):
+        """
+        Final sweep to identify and visit any remaining uncovered free areas.
+        """
 
         # Final pass to cover remaining uncovered cells
         res = self.raw_map.info.resolution
