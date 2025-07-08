@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import rospy
 import numpy as np
@@ -79,27 +79,6 @@ def map_callback(msg, source="global"):
             persistent_map[data == 100] = 100
 
         map_msg_latest = msg
-
-
-# def map_callback(msg):
-#     global persistent_map, persistent_trail, dosage_map, map_msg_latest, resolution, origin_x, origin_y
-#     with lock:
-#         h, w = msg.info.height, msg.info.width
-#         resolution = msg.info.resolution
-#         origin_x = msg.info.origin.position.x
-#         origin_y = msg.info.origin.position.y
-
-#         data = np.array(msg.data, dtype=np.int8).reshape((h, w))
-#         if persistent_map is None:
-#             persistent_map = data.copy()
-#             persistent_trail = np.full((h, w), TRAIL_UNKNOWN, dtype=np.int8)
-#             dosage_map = np.zeros((h, w), dtype=np.float32)
-#         else:
-#             mask = (persistent_trail == TRAIL_UNKNOWN)
-#             persistent_map[mask] = data[mask]
-#             persistent_map[data == 100] = 100
-
-#         map_msg_latest = msg
 
 def process_map():
     global last_update_time
@@ -191,22 +170,6 @@ def process_map():
             map_pub.publish(out)
 
         rate.sleep()
-
-# if __name__ == '__main__':
-#     rospy.init_node('map_trail_persistence')
-#     map_pub = rospy.Publisher('/dose_map', OccupancyGrid, queue_size=10)
-#     rospy.Subscriber('/move_base/global_costmap/costmap', OccupancyGrid, map_callback)
-
-#     # Display parameters
-#     rospy.loginfo(f"Dosage value per second: {dosage_value}")
-#     rospy.loginfo(f"Disinfect type: {disinfect_type}")
-#     rospy.loginfo(f"Threshold: {threshold}")
-
-#     thread = threading.Thread(target=process_map)
-#     thread.daemon = True
-#     thread.start()
-#     rospy.spin()
-
 
 if __name__ == '__main__':
     rospy.init_node('map_trail_persistence')
