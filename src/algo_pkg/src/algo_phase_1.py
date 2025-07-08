@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import rospy
 import actionlib
@@ -91,7 +91,7 @@ class CostmapCoverageExplorer:
         # global dose_map_latest
         with self.dose_map_lock:
             self.dose_map_latest = msg
-            print("Dose map received..>>>>>>>>>>>>>>>>>>>>>.")
+            print("Dose map received.")
 
 
     def count_trail_color1_cells(self):
@@ -344,6 +344,76 @@ class CostmapCoverageExplorer:
 
     def angle_diff(self, a, b):
         return math.atan2(math.sin(a - b), math.cos(a - b))
+    
+    def visit_all_trail_color_cells_until_done(self):
+        max_retries = 10  # safety: prevent infinite loop
+        retry = 0
+
+        while retry < max_retries and not rospy.is_shutdown():
+            rospy.sleep(1.0)
+            with self.dose_map_lock:
+                if self.dose_map_latest is None:
+                    rospy.logwarn("Dose map not available.")
+                    return
+
+                res = self.dose_map_latest.info.resolution
+                ox = self.dose_map_latest.info.origin.position.x
+                oy = self.dose_map_latest.info.origin.position.y
+                w = self.dose_map_latest.info.width
+                h = self.dose_map_latest.info.height
+
+                data = np.array(self.dose_map_latest.data, dtype=np.int8).reshape((h, w))
+
+                trail_cells = []
+                for y in range(h):
+                    for x in range(w):
+                        if data[y][x] == -2:
+                            wx = ox + x * res
+                            wy = oy + y * res
+                            trail_cells.append((wx, wy))
+
+            if not trail_cells:
+                rospy.loginfo("No more trail-colored (-2) cells remaining.")
+                return
+
+            rospy.loginfo(f"Pass {retry+1}: Found {len(trail_cells)} trail-colored cells. Clustering...")
+
+            # Cluster trail points
+            clusters = []
+            cluster_radius = 0.5
+            for pt in trail_cells:
+                assigned = False
+                for cluster in clusters:
+                    if any(math.hypot(pt[0] - c[0], pt[1] - c[1]) < cluster_radius for c in cluster):
+                        cluster.append(pt)
+                        assigned = True
+                        break
+                if not assigned:
+                    clusters.append([pt])
+
+            rospy.loginfo(f"Pass {retry+1}: Visiting {len(clusters)} clusters.")
+
+            for i, cluster in enumerate(clusters):
+                goal_pt = cluster[len(cluster) // 2]
+                pose = self.get_robot_pose()
+                if not pose:
+                    rospy.logwarn(f"[Trail Visit] Robot pose not available. Skipping cluster {i+1}")
+                    continue
+
+                rx, ry, _ = pose
+                rospy.loginfo(f"[Trail Visit] Moving to cluster {i+1}/{len(clusters)} at {goal_pt}")
+                success = self.send_goal(goal_pt[0], goal_pt[1], rx, ry)
+
+                if success:
+                    rospy.loginfo(f"[Trail Visit] Arrived at cluster {i+1}, waiting 5 seconds...")
+                    rospy.sleep(5.0)
+                else:
+                    rospy.logwarn(f"[Trail Visit] Failed to reach cluster {i+1}, skipping.")
+
+            retry += 1
+
+        rospy.logwarn("Max retries reached or shutdown detected. Trail visit loop exited.")
+
 
     def is_far_from_obstacles(self, mx, my):
         buffer_cells = int(self.obstacle_buffer / self.raw_map.info.resolution)
@@ -363,7 +433,7 @@ class CostmapCoverageExplorer:
         robot_map_x = int((rx - ox) / res)
         robot_map_y = int((ry - oy) / res)
 
-        max_radius = 5.0
+        max_radius = 3.0
         step = 1.0
 
         for radius in np.arange(step, max_radius + step, step):
@@ -458,7 +528,7 @@ class CostmapCoverageExplorer:
                     self.covered_points.append(goal)
                     self.mark_coverage(*goal)
                     self.mark_as_covered_in_map(*goal, radius=0.3)
-                    self.rotate_in_place()
+                    # self.rotate_in_place()
                     failures = 0
                 else:
                     rospy.logwarn("Goal failed.")
@@ -481,32 +551,9 @@ class CostmapCoverageExplorer:
         self.count_trail_color1_cells()
 
         self.visit_trail_color_cells()
+        self.visit_all_trail_color_cells_until_done()
 
-        rospy.loginfo("🚩 Trail region visiting complete.")
-        # res = self.raw_map.info.resolution
-        # ox, oy = self.raw_map.info.origin.position.x, self.raw_map.info.origin.position.y
-        # w, h = self.raw_map.info.width, self.raw_map.info.height
-
-        # unvisited_free_cells = []
-
-        # for y in range(h):
-        #     for x in range(w):
-        #         if self.merged_map[y][x] != 0:
-        #             continue  # Not free space
-
-        #         wx = ox + x * res
-        #         wy = oy + y * res
-
-        #         if any(math.hypot(wx - cx, wy - cy) < self.cover_radius for cx, cy in self.covered_points):
-        #             continue  # Already covered
-
-        #         unvisited_free_cells.append((wx, wy))
-
-        # rospy.loginfo(f"Remaining uncovered free cells: {len(unvisited_free_cells)}")
-
-        # # Optionally print some of them
-        # for i, pt in enumerate(unvisited_free_cells[:20]):
-        #     rospy.loginfo(f"Unvisited cell {i + 1}: x={pt[0]:.2f}, y={pt[1]:.2f}")
+        rospy.loginfo("Trail region visiting complete.")
         rospy.loginfo("Stopping.")
         self.cmd_vel_pub.publish(Twist())
 
@@ -539,7 +586,7 @@ class CostmapCoverageExplorer:
         rospy.loginfo(f"[Final Pass] Remaining uncovered free cells: {len(unvisited_free_cells)}")
 
         # Cluster remaining points
-        cluster_radius = 0.5
+        cluster_radius = 0.4
         clusters = []
 
         for pt in unvisited_free_cells:
@@ -575,61 +622,6 @@ class CostmapCoverageExplorer:
                 self.rotate_in_place()
             else:
                 rospy.logwarn(f"[Final Pass] Failed to reach cluster {i+1}. Moving to next cluster.")
-
-        # Continue coverage for remaining uncovered free cells
-        # res = self.raw_map.info.resolution
-        # ox, oy = self.raw_map.info.origin.position.x, self.raw_map.info.origin.position.y
-        # w, h = self.raw_map.info.width, self.raw_map.info.height
-
-        # unvisited_free_cells = []
-
-        # for y in range(h):
-        #     for x in range(w):
-        #         if self.merged_map[y][x] != 0:
-        #             continue  # Not free space
-
-        #         wx = ox + x * res
-        #         wy = oy + y * res
-
-        #         if any(math.hypot(wx - cx, wy - cy) < self.cover_radius for cx, cy in self.covered_points):
-        #             continue  # Already covered
-
-        #         unvisited_free_cells.append((wx, wy))
-
-        # rospy.loginfo(f"[Final Pass] Remaining uncovered free cells: {len(unvisited_free_cells)}")
-
-        # # Cluster unvisited cells (simple grid-based grouping)
-        # cluster_radius = 0.5  # meters
-        # clusters = []
-
-        # for pt in unvisited_free_cells:
-        #     assigned = False
-        #     for cluster in clusters:
-        #         if any(math.hypot(pt[0] - c[0], pt[1] - c[1]) < cluster_radius for c in cluster):
-        #             cluster.append(pt)
-        #             assigned = True
-        #             break
-        #     if not assigned:
-        #         clusters.append([pt])
-
-        # rospy.loginfo(f"[Final Pass] Clustered into {len(clusters)} regions")
-
-        # # Try to send one goal per cluster
-        # for i, cluster in enumerate(clusters):
-        #     goal_pt = cluster[len(cluster)//2]  # take middle point
-        #     rospy.loginfo(f"[Final Pass] Visiting cluster {i+1} at {goal_pt}")
-            
-        #     rx, ry, _ = self.get_robot_pose()
-        #     success = self.send_goal(goal_pt[0], goal_pt[1], rx, ry)
-            
-        #     if success:
-        #         rospy.loginfo(f"[Final Pass] Cluster {i+1} covered.")
-        #         self.covered_points.append(goal_pt)
-        #         self.mark_coverage(*goal_pt)
-        #         self.mark_as_covered_in_map(*goal_pt, radius=0.3)
-        #         self.rotate_in_place()
-        #     else:
-        #         rospy.logwarn(f"[Final Pass] Failed to reach cluster {i+1}")
 
 
 if __name__ == '__main__':
