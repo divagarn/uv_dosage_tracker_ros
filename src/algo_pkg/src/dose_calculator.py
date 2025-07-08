@@ -8,29 +8,30 @@ import time
 from nav_msgs.msg import OccupancyGrid
 from std_msgs.msg import Header
 
-TRAIL_COLOR1 = -2    
-TRAIL_COLOR2 = -50  
-TRAIL_COLOR3 = -100  
-TRAIL_COLOR4 = -150  
-TRAIL_UNKNOWN = -1  
+TRAIL_COLOR1 = -2
+TRAIL_COLOR2 = -50
+TRAIL_COLOR3 = -100
+TRAIL_COLOR4 = -150
+TRAIL_UNKNOWN = -1
 
-robot_radius = 0.60  
+robot_radius = 0.60
 
 # Global state
-persistent_map = None    # Base occupancy values
-persistent_trail = None  # Trail overlay
-dosage_map = None        # Dosage accumulation per cell
-map_msg_latest = None
-lock = threading.Lock()
+persistent_map = None   # Base occupancy values
+persistent_trail = None # Trail overlay
+dosage_map = None   # Dosage accumulation per cell
+map_msg_latest = None   # Latest map message
+lock = threading.Lock() # Synchronizes access to map data
 
-dosage_value = 0.41      # Dosage applied per second
-target_rate = 1.0        # Hz
+dosage_value = 0.41  # Dosage applied per second
+target_rate = 1.0  # Hz
 last_update_time = None
 origin_x = origin_y = 0.0
 resolution = None
 
 # Threshold mapping based on disinfect_type
 disinfect_type = rospy.get_param('disinfect_type', 0)
+#threshold map for the dose level's 0th index is level 1 and go on.
 threshold_map = {0: 10, 1: 20, 2: 30, 3: 40}
 threshold = threshold_map.get(disinfect_type, 70)
 
@@ -40,17 +41,37 @@ s2 = round(threshold * 0.50, 2)
 s3 = round(threshold * 0.75, 2)
 s4 = threshold
 
+
 def get_robot_position(listener, target_frame="base_link", reference_frame="map"):
+    """
+    Gets the robot's (x, y) position in the reference frame using TF.
+
+    Args:
+        listener (tf.TransformListener): TF listener used to query transforms.
+        target_frame (str): Robot's frame (default: "base_link").
+        reference_frame (str): Fixed world frame to transform into (default: "map").
+
+    Returns:
+        tuple or None: (x, y) position if successful, else None on TF failure.
+    """
     try:
         (trans, _) = listener.lookupTransform(reference_frame, target_frame, rospy.Time(0))
         return trans[:2]
     except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
         rospy.logwarn("TF lookup failed for robot position")
         return None
-    
+
+
 def map_callback(msg, source="global"):
+    """
+    Callback to handle incoming map data from a specified source.
+
+    Args:
+        msg (OccupancyGrid): The received map message.
+        source (str): Identifier for the map source (default is "global").
+    """
     global persistent_map, persistent_trail, dosage_map, map_msg_latest, resolution, origin_x, origin_y
-    with lock:
+    with lock:  # Safely access map info: dimensions, resolution, and origin
         h, w = msg.info.height, msg.info.width
         res = msg.info.resolution
         ox = msg.info.origin.position.x
@@ -80,7 +101,12 @@ def map_callback(msg, source="global"):
 
         map_msg_latest = msg
 
+
 def process_map():
+    """
+    Processes the received map data.
+    Updates robot footprint, dosage, and publishes the merged map.
+    """
     global last_update_time
     listener = tf.TransformListener()
     rate = rospy.Rate(target_rate)
@@ -171,18 +197,24 @@ def process_map():
 
         rate.sleep()
 
+
 if __name__ == '__main__':
     rospy.init_node('map_trail_persistence')
+
+    # Publishes the dosage occupancy grid map
     map_pub = rospy.Publisher('/dose_map', OccupancyGrid, queue_size=10)
 
+    # Subscribes to the global costmap from move_base
     rospy.Subscriber('/move_base/global_costmap/costmap',
                      OccupancyGrid,
                      lambda msg: map_callback(msg, source="global"))
 
+    # Subscribes to the local costmap from move_base
     rospy.Subscriber('/move_base/local_costmap/costmap',
                      OccupancyGrid,
                      lambda msg: map_callback(msg, source="local"))
 
+    # Merged map subscriber
     rospy.Subscriber('/merged_map',
                      OccupancyGrid,
                      lambda msg: map_callback(msg, source="merged"))
@@ -192,8 +224,8 @@ if __name__ == '__main__':
     rospy.loginfo(f"Disinfect type: {disinfect_type}")
     rospy.loginfo(f"Threshold: {threshold}")
 
+    # Start background thread to process map continuously
     thread = threading.Thread(target=process_map)
     thread.daemon = True
     thread.start()
-    rospy.spin()
-
+    rospy.spin()                    
